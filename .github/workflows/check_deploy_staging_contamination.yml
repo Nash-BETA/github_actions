@@ -109,7 +109,6 @@ jobs:
           - ローカルで \`master\` から開発ブランチを切り直し、必要なコミットのみ cherry-pick する
           - または \`git rebase --onto origin/master <混入開始コミットの親> <ブランチ名>\` で混入分を除外する
 
-          詳細は CONTRIBUTING.md の STGリリース手順を参照してください。
           EOF
           )
 
