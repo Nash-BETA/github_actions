@@ -1,0 +1,123 @@
+name: 'deploy/staging 混入チェック'
+
+on:
+  pull_request:
+    branches:
+      - master
+      - 'feature/**'
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  STAGING_BRANCH: 'deploy/staging'
+  COMMENT_MARKER: '<!-- deploy-staging-contamination-check -->'
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check-contamination:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'リポジトリをCheckout'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 'deploy/staging を fetch'
+        run: |
+          set -euo pipefail
+          git fetch origin "${STAGING_BRANCH}:refs/remotes/origin/${STAGING_BRANCH}"
+
+      - name: 'deploy/staging 由来のコミットを検出'
+        id: detect
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          contaminated_file="$(mktemp)"
+
+          # PR 固有コミットのうち、deploy/staging からも到達可能なものを列挙
+          while read -r sha; do
+            [ -z "${sha}" ] && continue
+            if git merge-base --is-ancestor "${sha}" "origin/${STAGING_BRANCH}"; then
+              subject=$(git log -1 --format='%s' "${sha}")
+              printf '%s %s\n' "${sha}" "${subject}" >> "${contaminated_file}"
+            fi
+          done < <(git log --format='%H' "${BASE_SHA}..${HEAD_SHA}")
+
+          if [ -s "${contaminated_file}" ]; then
+            echo "contaminated=true" >> "$GITHUB_OUTPUT"
+            echo "=== 検出された混入コミット ==="
+            cat "${contaminated_file}"
+            {
+              echo "commits<<COMMITS_EOF"
+              cat "${contaminated_file}"
+              echo "COMMITS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "contaminated=false" >> "$GITHUB_OUTPUT"
+            echo "deploy/staging 由来のコミットは検出されませんでした"
+          fi
+
+      - name: '既存の警告コメントを削除'
+        if: always()
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          # マーカーで始まる既存コメントを全て削除（重複防止）
+          comment_ids=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"${COMMENT_MARKER}\")) | .id] | .[]")
+
+          for id in ${comment_ids}; do
+            gh api -X DELETE "repos/${REPO}/issues/comments/${id}"
+            echo "Deleted previous comment: ${id}"
+          done
+
+      - name: '混入時の PR コメントを投稿'
+        if: steps.detect.outputs.contaminated == 'true'
+        env:
+          COMMITS: ${{ steps.detect.outputs.commits }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          # 検出コミットを markdown の箇条書きに整形
+          formatted=$(awk '{
+            sha=substr($1, 1, 8)
+            $1=""
+            sub(/^ /, "")
+            print "- `" sha "` " $0
+          }' <<< "${COMMITS}")
+
+          body=$(cat <<EOF
+          ${COMMENT_MARKER}
+          ## ⚠️ このPRに \`${STAGING_BRANCH}\` 由来のコミットが含まれています
+
+          以下のコミットは \`master\` には含まれず、\`${STAGING_BRANCH}\` 経由で取り込まれたものです。GitHub UI上で \`${STAGING_BRANCH}\` とのコンフリクトを解消した場合、他の開発ブランチのコミットが逆流している可能性があります。
+
+          ### 該当コミット
+          ${formatted}
+
+          ### 対処方法
+          - ローカルで \`master\` から開発ブランチを切り直し、必要なコミットのみ cherry-pick する
+          - または \`git rebase --onto origin/master <混入開始コミットの親> <ブランチ名>\` で混入分を除外する
+
+          詳細は CONTRIBUTING.md の STGリリース手順を参照してください。
+          EOF
+          )
+
+          jq -n --arg body "${body}" '{body: $body}' \
+            | gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --input -
+
+      - name: '混入検出時は Job を失敗させる'
+        if: steps.detect.outputs.contaminated == 'true'
+        run: |
+          echo "::error::deploy/staging 由来のコミットがPRに混入しています。PRコメントを参照してください。"
+          exit 1
